@@ -5,6 +5,7 @@ on:
   schedule: # 触发机制为定时任务
     - cron: "44 4 * * *" # 每天4点44分自动执行
     - cron: "44 16 * * *" # 每天16点44分自动执行
+    - cron: "*/60 * * * *" # 每小时自动触发
 jobs:
   autosend:
     runs-on: ubuntu-latest # 运行环境为最新的Ubuntu
@@ -25,3 +26,189 @@ jobs:
           TEXTNOW_MESSAGE: ${{secrets.TEXTNOW_MESSAGE}} # 获取并设置定义好的发送的信息内容环境变量值
         run: |
           node index.js
+const actionFunc = async (username, password, recipient, message) => {
+  console.log("textnow bot start...");
+  const path = require("path");
+  const fs = require("fs").promises;
+  const puppeteer = require("puppeteer");
+  const textNowHelper = require("./utils/helper");
+
+  let browser = null;
+  let page = null;
+  let md5Username = textNowHelper.md5(username).substr(0, 8);
+
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+    });
+    page = await browser.newPage();
+    const client = await page.target().createCDPSession();
+    let cookies = null;
+
+    // Importing exsiting cookies from file
+    try {
+      console.log("Importing existing cookies...");
+      const cookiesJSON = await fs.readFile(
+        path.resolve(__dirname, `.cahce/${md5Username}.cookies.json`)
+      );
+      cookies = JSON.parse(cookiesJSON);
+    } catch (error) {
+      console.log("Failed to import existing cookies.");
+    }
+
+    // Log into TextNow and get cookies
+    try {
+      console.log("Logging in with existing cookies");
+      await page.setCookie(...cookies);
+      cookies = await textNowHelper.logIn(page, client);
+    } catch (error) {
+      console.log("Failed to log in with existing cookies.");
+      console.log("Logging in with account credentials...");
+      cookies = await textNowHelper.logIn(page, client, username, password);
+    }
+
+    try {
+      console.log("Successfully logged into TextNow!");
+      // Save cookies to file
+      await fs.writeFile(
+        path.resolve(__dirname, `.cahce/${md5Username}.cookies.json`),
+        JSON.stringify(cookies)
+      );
+    } catch (error) {
+      console.log("Failed to save cookies to file.");
+    }
+
+    // Select a conversation using recipient info
+    console.log("Selecting conversation...");
+    await textNowHelper.selectConversation(page, recipient);
+
+    // Send a message to the current recipient
+    console.log("Sending message...");
+    await textNowHelper.sendMessage(page, message);
+
+    console.log("Message sent!");
+    await browser.close();
+  } catch (error) {
+    console.log(error);
+
+    if (page) {
+      await page.screenshot({ path: "./error-screenshot.jpg", type: "jpeg" });
+    }
+
+    if (browser) {
+      await browser.close();
+    }
+
+    process.exit(1);
+  }
+};
+
+(async () => {
+  console.log("start...");
+  const config = require("./config");
+
+  const { username, password, recipient, message } = config;
+  const arrUsername = username.split("|");
+  const arrPassword = password.split("|");
+  if (arrUsername.length === arrPassword.length) {
+    for (let i = 0, length = arrUsername.length; i < length; i++) {
+      const strUsername = arrUsername[i];
+      const strPassword = arrPassword[i];
+
+      console.log(`User:${strUsername} start...`);
+      await actionFunc(strUsername, strPassword, recipient, message);
+      console.log(`User:${strUsername} end...`);
+    }
+  } else {
+    console.log("User information is error.");
+  }
+
+  console.log("end...");
+})();
+/**
+ * Log into TextNow and get cookies
+ * @param {object} page Puppeteer browser page
+ * @param {object} client Puppeteer CDPSession
+ * @param {string} username Optional account credential
+ * @param {string} password Optional account credential
+ * @return {object} Updated login cookies
+ */
+module.exports.logIn = async (page, client, username, password) => {
+  await Promise.all([
+    page.goto("https://www.textnow.com/login"),
+    page.waitForNavigation({ waitUtil: "networkidle2" }),
+  ]);
+
+  if (username && password) {
+    await page.type("#txt-username", username);
+    await page.type("#txt-password", password);
+
+    const logInButton = await page.waitForSelector("#btn-login");
+    await Promise.all([logInButton.click(), page.waitForNavigation()]);
+
+    const cookies = (await client.send("Network.getAllCookies")).cookies;
+
+    return cookies;
+  }
+
+  const isLoggedIn = page.url().includes("/messaging");
+  if (!isLoggedIn) {
+    throw new Error("Deteacted invalid or expires cookies");
+  }
+
+  const cookies = (await client.send("Network.getAllCookies")).cookies;
+
+  return cookies;
+};
+
+/**
+ * Select a conversation using recipient info
+ * @param {object} page Puppeteer browser page
+ * @param {string} recipient Recipient info
+ */
+module.exports.selectConversation = async (page, recipient) => {
+  await Promise.all([
+    page.goto("https://www.textnow.com/messaging"),
+    page.waitForNavigation({ waitUtil: "networkidle2" }),
+  ]);
+
+  await page.waitFor(5000);
+
+  await page.$eval("#newText", (element) => element.click());
+  await page.waitFor(500);
+
+  const recipientField = await page.waitForSelector(
+    ".newConversationTextField"
+  );
+  await page.waitFor(500);
+  await recipientField.type(recipient);
+  await page.waitFor(500);
+  await page.keyboard.press("Enter");
+  await page.waitFor(3000);
+};
+
+/**
+ * Send a message to the current recipient
+ * @param {object} page Puppeteer browser page
+ * @param {string } message Message content
+ */
+module.exports.sendMessage = async (page, message) => {
+  const messageField = await page.waitForSelector("#text-input");
+  await page.waitFor(500);
+  await messageField.type(message);
+  await page.waitFor(500);
+  await page.keyboard.press("Enter");
+  await page.waitFor(5000);
+};
+
+/**
+ * Encipher string and return the result
+ * @param {string} str crypto string
+ */
+module.exports.md5 = (str) => {
+  const crypto = require("crypto");
+  const md5 = crypto.createHash("md5");
+  md5.update(str, "utf8");
+
+  return md5.digest("hex").toUpperCase();
+};
